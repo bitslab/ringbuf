@@ -52,7 +52,7 @@ impl<T: Sized> RingBuffer<T> {
     /// Splits ring buffer into producer and consumer.
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        (Producer { rb: arc.clone() }, Consumer { rb: arc })
+        (Producer { rb: arc.clone(), nonblocking: false}, Consumer { rb: arc, nonblocking: false})
     }
 
     /// Returns capacity of the ring buffer.

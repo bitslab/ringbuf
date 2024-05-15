@@ -12,6 +12,7 @@ use crate::{consumer::Consumer, ring_buffer::*};
 /// Producer part of ring buffer.
 pub struct Producer<T> {
     pub(crate) rb: Arc<RingBuffer<T>>,
+    pub(crate) nonblocking: bool
 }
 
 impl<T: Sized> Producer<T> {
@@ -41,6 +42,20 @@ impl<T: Sized> Producer<T> {
     /// Actual length may be equal to or less than the returned value.
     pub fn len(&self) -> usize {
         self.rb.len()
+    }
+
+    /// Checks if the consumer end is still present.
+    pub fn is_consumer_alive(&self) -> bool {
+      if Arc::strong_count(&self.rb) >= 2 {
+        true
+      }
+      else {
+        false
+      }
+    }
+
+    pub fn set_nonblocking(&mut self) {
+      self.nonblocking = true;
     }
 
     /// The remaining space in the buffer.
@@ -273,11 +288,24 @@ impl Producer<u8> {
 #[cfg(feature = "std")]
 impl Write for Producer<u8> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let n = self.push_slice(buffer);
-        if n == 0 && !buffer.is_empty() {
-            Err(io::ErrorKind::WouldBlock.into())
-        } else {
-            Ok(n)
+        loop {
+            let n = self.push_slice(buffer);
+            if n == 0 && self.is_consumer_alive() {
+                if !self.nonblocking {
+                    continue
+                }
+                else {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+            } 
+            /*
+            else if n == 0 && !self.is_consumer_alive() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            */
+            else {
+                return Ok(n);
+            }
         }
     }
 
