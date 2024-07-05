@@ -9,7 +9,6 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use std::sync::{Condvar, Mutex};
-use sync_spin::*;
 
 pub(crate) struct SharedVec<T: Sized> {
     cell: UnsafeCell<Vec<T>>,
@@ -38,8 +37,8 @@ pub struct RingBuffer<T: Sized> {
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
     pub(crate) saved_buf: Mutex<SavedBuffer<T>>,
-    pub(crate) size_copied: AtomicUsize,
     pub(crate) cvar: Condvar,
+    pub(crate) num_sleepers: AtomicUsize,
 }
 
 impl<T: Sized> RingBuffer<T> {
@@ -52,8 +51,8 @@ impl<T: Sized> RingBuffer<T> {
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             saved_buf: SavedBuffer::new_mutex(),
-            size_copied: AtomicUsize::new(0),
             cvar: Condvar::new(),
+            num_sleepers: AtomicUsize::new(0),
         }
     }
 
@@ -203,7 +202,7 @@ pub fn move_items<T>(src: &mut Consumer<T>, dst: &mut Producer<T>, count: Option
 
 /// Immutable buffer info, holding a pointer and length
 #[derive(Debug)]
-pub(crate) struct BufferInfo<T: Sized>(*const T, usize);
+pub(crate) struct BufferInfo<T: Sized>(pub *const T, pub usize);
 impl<T: Sized> Clone for BufferInfo<T> {
     fn clone(&self) -> Self {
         *self
@@ -211,21 +210,39 @@ impl<T: Sized> Clone for BufferInfo<T> {
 }
 impl<T: Sized> Copy for BufferInfo<T> {}
 
+impl<T: Sized> From<&[T]> for BufferInfo<T> {
+    fn from(value: &[T]) -> Self {
+        Self(value.as_ptr(), value.len())
+    }
+}
+
 /// Mutable buffer info, holding a pointer and length
 #[derive(Debug)]
-pub(crate) struct MutBufferInfo<T: Sized>(*mut T, usize);
+pub(crate) struct MutBufferInfo<T: Sized>(pub *mut T, pub usize);
 impl<T: Sized> Clone for MutBufferInfo<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 impl<T: Sized> Copy for MutBufferInfo<T> {}
+impl<'a, T: Sized> From<&'a MutBufferInfo<T>> for &'a mut [T] {
+    fn from(value: &'a MutBufferInfo<T>) -> &'a mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(value.0, value.1) }
+    }
+}
+
+impl<T: Sized> From<&mut [T]> for MutBufferInfo<T> {
+    fn from(value: &mut [T]) -> Self {
+        Self(value.as_mut_ptr(), value.len())
+    }
+}
 
 /// Enum which tracks saved buffer info
 #[derive(Debug)]
 pub(crate) enum SavedBuffer<T: Sized> {
     Reader(MutBufferInfo<T>),
     Writer(BufferInfo<T>),
+    Copied(usize),
     None,
 }
 impl<T: Sized> Clone for SavedBuffer<T> {
@@ -238,6 +255,14 @@ impl<T: Sized> Copy for SavedBuffer<T> {}
 impl<T: Sized> SavedBuffer<T> {
     pub fn new_mutex() -> Mutex<Self> {
         Mutex::new(Self::None)
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, SavedBuffer::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !matches!(self, SavedBuffer::None)
     }
 }
 

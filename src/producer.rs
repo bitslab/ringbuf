@@ -4,8 +4,10 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic::Ordering,
 };
+use std::cmp;
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+use sync_spin::{check_and_sleep, mutex_spin::SpinFirst};
 
 use crate::{consumer::Consumer, ring_buffer::*};
 
@@ -46,11 +48,7 @@ impl<T: Sized> Producer<T> {
 
     /// Checks if the consumer end is still present.
     pub fn is_consumer_alive(&self) -> bool {
-        if Arc::strong_count(&self.rb) >= 2 {
-            true
-        } else {
-            false
-        }
+        Arc::strong_count(&self.rb) >= 2
     }
 
     pub fn set_nonblocking(&mut self) {
@@ -133,20 +131,6 @@ impl<T: Sized> Producer<T> {
     /// *You should properly fill the slice and manage remaining elements after copy.*
     ///
     pub unsafe fn push_copy(&mut self, elems: &[MaybeUninit<T>]) -> usize {
-        if cfg!(feature = "reader-sleep-copy") {
-            // We need to check if the reader had a saved buffer
-            let buffer = *self.rb.saved_buf.lock().unwrap();
-            match buffer {
-                SavedBuffer::None => {}
-                SavedBuffer::Reader(reader_buf) => {}
-                SavedBuffer::Writer(_) => {}
-            }
-        }
-
-        if cfg!(feature = "writer-sleep-copy") {
-            //
-        }
-
         self.push_access(|left, right| -> usize {
             if elems.len() < left.len() {
                 copy_nonoverlapping(elems.as_ptr(), left.as_mut_ptr(), elems.len());
@@ -242,7 +226,90 @@ impl<T: Sized + Copy> Producer<T> {
     ///
     /// Returns count of elements been appended to the ring buffer.
     pub fn push_slice(&mut self, elems: &[T]) -> usize {
-        unsafe { self.push_copy(&*(elems as *const [T] as *const [MaybeUninit<T>])) }
+        const SPIN_FIRST_CYCLES: u64 = 10_000; //TODO:(Jacob) Evaluate this choice of number
+        let mut bytes_written = 0usize;
+        if cfg!(feature = "reader-sleep-copy") {
+            // We need to check if the reader had a saved buffer
+            let mut saved_buf_lock = self
+                .rb
+                .saved_buf
+                .spin_first_lock(SPIN_FIRST_CYCLES)
+                .unwrap();
+            if let SavedBuffer::<T>::Reader(reader_buf) = *saved_buf_lock {
+                // Reader had a saved buffer; copy to it
+                let reader_slice: &mut [T] = (&reader_buf).into();
+                let copy_len = cmp::min(elems.len(), reader_slice.len());
+                unsafe {
+                    std::intrinsics::copy_nonoverlapping(elems.as_ptr(), reader_buf.0, copy_len);
+                }
+
+                // Overwrite the enum for the saved buffer we just wrote to with the number of bytes we wrote
+                *saved_buf_lock = SavedBuffer::Copied(copy_len);
+
+                // Update the number of bytes written
+                bytes_written += copy_len;
+
+                // Set the number of bytes we copied before waking the reader
+                // This will "wake" the reader already if they are just spinning
+                // self.rb.size_copied.store(copy_len, Ordering::Relaxed);
+
+                // Use Condvar to wake the reader if they are actually asleep (and not spinning)
+                if self.rb.num_sleepers.load(Ordering::Acquire) > 0 {
+                    self.rb.cvar.notify_all();
+                }
+
+                // If we've written all the bytes we want written, return now
+                if bytes_written == elems.len() {
+                    return bytes_written;
+                }
+            }
+        }
+
+        if cfg!(feature = "writer-sleep-copy") {
+            // We still have more to write.
+            let mut guard = self
+                .rb
+                .saved_buf
+                .spin_first_lock(SPIN_FIRST_CYCLES)
+                .unwrap();
+            if guard.is_none() {
+                // Set our buffer if noone else has theirs saved
+                *guard = SavedBuffer::Writer(elems.into());
+
+                // Drop the guard
+                drop(guard);
+
+                // Spin and then eventually loop until we have been copied from
+                let mut num_copied = 0usize;
+                check_and_sleep(
+                    &self.rb.saved_buf,
+                    &self.rb.cvar,
+                    |t| match t {
+                        SavedBuffer::Copied(n) => {
+                            num_copied = *n;
+                            true
+                        }
+                        _ => false,
+                    },
+                    SPIN_FIRST_CYCLES,
+                    &self.rb.num_sleepers,
+                );
+                bytes_written += num_copied;
+                // Reset saved buffer to none
+                *self
+                    .rb
+                    .saved_buf
+                    .spin_first_lock(SPIN_FIRST_CYCLES)
+                    .unwrap() = SavedBuffer::None;
+
+                if bytes_written == elems.len() {
+                    return bytes_written;
+                }
+            }
+        }
+
+        bytes_written
+            + unsafe { self.push_copy(&*(elems as *const [T] as *const [MaybeUninit<T>])) }
     }
 }
 

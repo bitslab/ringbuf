@@ -1,5 +1,8 @@
 use std::ptr::addr_of_mut;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Condvar, Mutex,
+};
 
 pub mod mutex_spin;
 use mutex_spin::SpinFirst;
@@ -21,11 +24,12 @@ fn rdtscp() -> u64 {
 /// # Type Parameters
 /// - `T`: The type of the data protected by `guard`.
 /// - `F`: The closure type of `condition`.
-pub fn check_and_sleep<T, F: Fn(&T) -> bool>(
-    mutex: Mutex<T>,
+pub fn check_and_sleep<T, F: FnMut(&T) -> bool>(
+    mutex: &Mutex<T>,
     condvar: &Condvar,
-    condition: F,
+    mut condition: F,
     cycles: u64,
+    num_sleepers: &AtomicUsize,
 ) {
     const SPIN_FIRST_CYCLES: u64 = 10_000; //TODO:(Jacob) Evaluate this choice of number
 
@@ -46,21 +50,20 @@ pub fn check_and_sleep<T, F: Fn(&T) -> bool>(
             break;
         }
 
-        std::hint::spin_loop(); // x86-64 "pause" instruction
+        for _ in 0..10 {
+            std::hint::spin_loop(); // x86-64 "pause" instruction
+        }
     }
 
     // Default to standard OS condvar sleeping
+    num_sleepers.fetch_add(1, Ordering::Acquire);
     let mut guard = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
     while !condition(&*guard) {
         guard = condvar.wait(guard).unwrap();
     }
+    num_sleepers.fetch_sub(1, Ordering::Acquire);
 }
 
 // TODO:(Jacob) Implement some tests
 #[cfg(test)]
-mod tests {
-    use crate::*;
-
-    #[test]
-    fn test_one() {}
-}
+mod tests {}

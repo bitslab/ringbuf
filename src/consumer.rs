@@ -4,17 +4,18 @@ use core::{
     mem::{self, MaybeUninit},
     ops::Range,
     ptr::copy_nonoverlapping,
-    sync::atomic,
+    sync::atomic::{self, Ordering},
 };
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+use sync_spin::{check_and_sleep, mutex_spin::SpinFirst};
 
 use crate::{producer::Producer, ring_buffer::*};
 
 /// Consumer part of ring buffer.
 pub struct Consumer<T> {
     pub(crate) rb: Arc<RingBuffer<T>>,
-    pub(crate) nonblocking: bool
+    pub(crate) nonblocking: bool,
 }
 
 impl<T: Sized> Consumer<T> {
@@ -48,16 +49,11 @@ impl<T: Sized> Consumer<T> {
 
     /// Checks if the producer end is still present.
     pub fn is_producer_alive(&self) -> bool {
-      if Arc::strong_count(&self.rb) >= 2 {
-        true
-      }
-      else {
-        false
-      }
+        Arc::strong_count(&self.rb) >= 2
     }
 
     pub fn set_nonblocking(&mut self) {
-      self.nonblocking = true;
+        self.nonblocking = true;
     }
 
     /// The remaining space in the buffer.
@@ -341,9 +337,84 @@ impl<T: Sized + Copy> Consumer<T> {
     /// Removes first elements from the ring buffer and writes them into a slice.
     /// Elements should be [`Copy`](https://doc.rust-lang.org/std/marker/trait.Copy.html).
     ///
-    /// On success returns count of elements been removed from the ring buffer.
+    /// On success returns count of elements been copied from the ring buffer (or any saved buffers).
     pub fn pop_slice(&mut self, elems: &mut [T]) -> usize {
-        unsafe { self.pop_copy(&mut *(elems as *mut [T] as *mut [MaybeUninit<T>])) }
+        const SPIN_FIRST_CYCLES: u64 = 10_000; //TODO:(Jacob) Evaluate this choice of number
+        let mut bytes_read = 0usize;
+        // First, read as many as we can from the actual ring buffer
+        bytes_read += unsafe {
+            self.pop_copy(&mut *(&mut elems[bytes_read..] as *mut [T] as *mut [MaybeUninit<T>]))
+        };
+
+        if cfg!(feature = "writer-sleep-copy") {
+            // TODO:(Jacob) Check if writer saved a buffer and do copy
+            let mut saved_buf_lock = self
+                .rb
+                .saved_buf
+                .spin_first_lock(SPIN_FIRST_CYCLES)
+                .unwrap();
+            if let SavedBuffer::<T>::Writer(writer_buf) = *saved_buf_lock {
+                let copy_len = cmp::min(elems.len(), writer_buf.1);
+                unsafe {
+                    std::intrinsics::copy_nonoverlapping(
+                        writer_buf.0,
+                        elems.as_mut_ptr(),
+                        copy_len,
+                    );
+                }
+                *saved_buf_lock = SavedBuffer::Copied(copy_len);
+                bytes_read += copy_len;
+                if self.rb.num_sleepers.load(Ordering::Acquire) > 0 {
+                    self.rb.cvar.notify_all();
+                }
+                if bytes_read == elems.len() {
+                    return bytes_read;
+                }
+            }
+        }
+
+        if cfg!(feature = "reader-sleep-copy") {
+            let mut saved_buf_lock = self
+                .rb
+                .saved_buf
+                .spin_first_lock(SPIN_FIRST_CYCLES)
+                .unwrap();
+            if saved_buf_lock.is_none() {
+                // Set our buffer if noone else has theirs saved
+                *saved_buf_lock = SavedBuffer::Reader(elems.into());
+
+                // Drop the guard
+                drop(saved_buf_lock);
+
+                // Spin and then eventually loop until we have been copied from
+                let mut num_copied = 0usize;
+                check_and_sleep(
+                    &self.rb.saved_buf,
+                    &self.rb.cvar,
+                    |t| match t {
+                        SavedBuffer::Copied(n) => {
+                            num_copied = *n;
+                            true
+                        }
+                        _ => false,
+                    },
+                    SPIN_FIRST_CYCLES,
+                    &self.rb.num_sleepers,
+                );
+                bytes_read += num_copied;
+                // Reset saved buffer to none
+                *self
+                    .rb
+                    .saved_buf
+                    .spin_first_lock(SPIN_FIRST_CYCLES)
+                    .unwrap() = SavedBuffer::None;
+                if bytes_read == elems.len() {
+                    return bytes_read;
+                }
+            }
+        }
+
+        bytes_read // Return what we were able to read
     }
 }
 
@@ -410,15 +481,14 @@ impl Read for Consumer<u8> {
             if n == 0 && self.is_producer_alive() {
                 if !self.nonblocking {
                     continue;
-                }
-                else {
+                } else {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
             }
             /*
             else if n == 0 && !self.is_producer_alive() {
                 return Err(io::ErrorKind::NotFound.into());
-            } 
+            }
             */
             else {
                 return Ok(n);
