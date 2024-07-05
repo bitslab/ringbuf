@@ -8,6 +8,8 @@ use core::{
     ptr::{self, copy},
     sync::atomic::{AtomicUsize, Ordering},
 };
+use std::sync::{Condvar, Mutex};
+use sync_spin::*;
 
 pub(crate) struct SharedVec<T: Sized> {
     cell: UnsafeCell<Vec<T>>,
@@ -35,6 +37,9 @@ pub struct RingBuffer<T: Sized> {
     pub(crate) data: SharedVec<MaybeUninit<T>>,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
+    pub(crate) saved_buf: Mutex<SavedBuffer<T>>,
+    pub(crate) size_copied: AtomicUsize,
+    pub(crate) cvar: Condvar,
 }
 
 impl<T: Sized> RingBuffer<T> {
@@ -46,13 +51,25 @@ impl<T: Sized> RingBuffer<T> {
             data: SharedVec::new(data),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
+            saved_buf: SavedBuffer::new_mutex(),
+            size_copied: AtomicUsize::new(0),
+            cvar: Condvar::new(),
         }
     }
 
     /// Splits ring buffer into producer and consumer.
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
         let arc = Arc::new(self);
-        (Producer { rb: arc.clone(), nonblocking: false}, Consumer { rb: arc, nonblocking: false})
+        (
+            Producer {
+                rb: arc.clone(),
+                nonblocking: false,
+            },
+            Consumer {
+                rb: arc,
+                nonblocking: false,
+            },
+        )
     }
 
     /// Returns capacity of the ring buffer.
@@ -183,3 +200,45 @@ pub fn move_items<T>(src: &mut Consumer<T>, dst: &mut Producer<T>, count: Option
         })
     }
 }
+
+/// Immutable buffer info, holding a pointer and length
+#[derive(Debug)]
+pub(crate) struct BufferInfo<T: Sized>(*const T, usize);
+impl<T: Sized> Clone for BufferInfo<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Sized> Copy for BufferInfo<T> {}
+
+/// Mutable buffer info, holding a pointer and length
+#[derive(Debug)]
+pub(crate) struct MutBufferInfo<T: Sized>(*mut T, usize);
+impl<T: Sized> Clone for MutBufferInfo<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Sized> Copy for MutBufferInfo<T> {}
+
+/// Enum which tracks saved buffer info
+#[derive(Debug)]
+pub(crate) enum SavedBuffer<T: Sized> {
+    Reader(MutBufferInfo<T>),
+    Writer(BufferInfo<T>),
+    None,
+}
+impl<T: Sized> Clone for SavedBuffer<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Sized> Copy for SavedBuffer<T> {}
+
+impl<T: Sized> SavedBuffer<T> {
+    pub fn new_mutex() -> Mutex<Self> {
+        Mutex::new(Self::None)
+    }
+}
+
+unsafe impl<T: Sized> Send for SavedBuffer<T> {}

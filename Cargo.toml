@@ -17,6 +17,8 @@ license = "MIT/Apache-2.0"
 default = ["std"]
 std = []
 benchmark = []
+reader-sleep-copy = []
+writer-sleep-copy = []
 
 [[example]]
 name = "simple"
@@ -26,3 +28,4 @@ required-features = ["std"]
 
 [dependencies]
 cache-padded = "1.1.1"
+sync_spin = { path = './sync_spin' }

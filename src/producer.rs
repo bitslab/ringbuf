@@ -12,7 +12,7 @@ use crate::{consumer::Consumer, ring_buffer::*};
 /// Producer part of ring buffer.
 pub struct Producer<T> {
     pub(crate) rb: Arc<RingBuffer<T>>,
-    pub(crate) nonblocking: bool
+    pub(crate) nonblocking: bool,
 }
 
 impl<T: Sized> Producer<T> {
@@ -46,16 +46,15 @@ impl<T: Sized> Producer<T> {
 
     /// Checks if the consumer end is still present.
     pub fn is_consumer_alive(&self) -> bool {
-      if Arc::strong_count(&self.rb) >= 2 {
-        true
-      }
-      else {
-        false
-      }
+        if Arc::strong_count(&self.rb) >= 2 {
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_nonblocking(&mut self) {
-      self.nonblocking = true;
+        self.nonblocking = true;
     }
 
     /// The remaining space in the buffer.
@@ -134,6 +133,20 @@ impl<T: Sized> Producer<T> {
     /// *You should properly fill the slice and manage remaining elements after copy.*
     ///
     pub unsafe fn push_copy(&mut self, elems: &[MaybeUninit<T>]) -> usize {
+        if cfg!(feature = "reader-sleep-copy") {
+            // We need to check if the reader had a saved buffer
+            let buffer = *self.rb.saved_buf.lock().unwrap();
+            match buffer {
+                SavedBuffer::None => {}
+                SavedBuffer::Reader(reader_buf) => {}
+                SavedBuffer::Writer(_) => {}
+            }
+        }
+
+        if cfg!(feature = "writer-sleep-copy") {
+            //
+        }
+
         self.push_access(|left, right| -> usize {
             if elems.len() < left.len() {
                 copy_nonoverlapping(elems.as_ptr(), left.as_mut_ptr(), elems.len());
@@ -292,12 +305,11 @@ impl Write for Producer<u8> {
             let n = self.push_slice(buffer);
             if n == 0 && self.is_consumer_alive() {
                 if !self.nonblocking {
-                    continue
-                }
-                else {
+                    continue;
+                } else {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
-            } 
+            }
             /*
             else if n == 0 && !self.is_consumer_alive() {
                 return Err(io::ErrorKind::NotFound.into());
