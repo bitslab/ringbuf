@@ -1,3 +1,4 @@
+use std::alloc::Allocator;
 use alloc::sync::Arc;
 use core::{
     cmp::{self, min},
@@ -8,16 +9,16 @@ use core::{
 };
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
-
 use crate::{producer::Producer, ring_buffer::*};
 
+use crate::loop_with_delay;
 /// Consumer part of ring buffer.
-pub struct Consumer<T> {
-    pub(crate) rb: Arc<RingBuffer<T>>,
+pub struct Consumer<T, A: Allocator + Clone> {
+    pub(crate) rb: Arc<RingBuffer<T, A>, A>,
     pub(crate) nonblocking: bool
 }
 
-impl<T: Sized> Consumer<T> {
+impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
     /// Returns capacity of the ring buffer.
     ///
     /// The capacity of the buffer is constant.
@@ -332,12 +333,12 @@ impl<T: Sized> Consumer<T> {
     /// The producer and consumer parts may be of different buffers as well as of the same one.
     ///
     /// On success returns count of elements been moved.
-    pub fn move_to(&mut self, other: &mut Producer<T>, count: Option<usize>) -> usize {
+    pub fn move_to(&mut self, other: &mut Producer<T, A>, count: Option<usize>) -> usize {
         move_items(self, other, count)
     }
 }
 
-impl<T: Sized + Copy> Consumer<T> {
+impl<T: Sized + Copy, A: Allocator + Clone> Consumer<T, A> {
     /// Removes first elements from the ring buffer and writes them into a slice.
     /// Elements should be [`Copy`](https://doc.rust-lang.org/std/marker/trait.Copy.html).
     ///
@@ -348,7 +349,7 @@ impl<T: Sized + Copy> Consumer<T> {
 }
 
 #[cfg(feature = "std")]
-impl Consumer<u8> {
+impl<A: Allocator + Clone> Consumer<u8, A> {
     /// Removes at most first `count` bytes from the ring buffer and writes them into
     /// a [`Write`](https://doc.rust-lang.org/std/io/trait.Write.html) instance.
     /// If `count` is `None` then as much as possible bytes will be written.
@@ -403,9 +404,9 @@ impl Consumer<u8> {
 }
 
 #[cfg(feature = "std")]
-impl Read for Consumer<u8> {
+impl<A: Allocator + Clone> Read for Consumer<u8, A> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
+        loop_with_delay!({
             let n = self.pop_slice(buffer);
             if n == 0 && self.is_producer_alive() {
                 if !self.nonblocking {
@@ -423,6 +424,6 @@ impl Read for Consumer<u8> {
             else {
                 return Ok(n);
             }
-        }
+        })
     }
 }

@@ -1,3 +1,5 @@
+#![feature(allocator_api)]
+
 //! Lock-free single-producer single-consumer (SPSC) FIFO ring buffer with direct access to inner data.
 //!
 //! # Overview
