@@ -26,3 +26,4 @@ required-features = ["std"]
 
 [dependencies]
 cache-padded = "1.1.1"
+rand = "*"

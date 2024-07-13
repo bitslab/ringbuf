@@ -1,3 +1,4 @@
+use std::alloc::Allocator;
 use alloc::sync::Arc;
 use core::{
     mem::{self, MaybeUninit},
@@ -8,14 +9,15 @@ use core::{
 use std::io::{self, Read, Write};
 
 use crate::{consumer::Consumer, ring_buffer::*};
+use crate::loop_with_delay;
 
 /// Producer part of ring buffer.
-pub struct Producer<T> {
-    pub(crate) rb: Arc<RingBuffer<T>>,
+pub struct Producer<T, A: Allocator + Clone> {
+    pub(crate) rb: Arc<RingBuffer<T, A>, A>,
     pub(crate) nonblocking: bool
 }
 
-impl<T: Sized> Producer<T> {
+impl<T: Sized, A: Allocator + Clone> Producer<T, A> {
     /// Returns capacity of the ring buffer.
     ///
     /// The capacity of the buffer is constant.
@@ -218,12 +220,12 @@ impl<T: Sized> Producer<T> {
     /// The producer and consumer parts may be of different buffers as well as of the same one.
     ///
     /// On success returns number of elements been moved.
-    pub fn move_from(&mut self, other: &mut Consumer<T>, count: Option<usize>) -> usize {
+    pub fn move_from(&mut self, other: &mut Consumer<T, A>, count: Option<usize>) -> usize {
         move_items(other, self, count)
     }
 }
 
-impl<T: Sized + Copy> Producer<T> {
+impl<T: Sized + Copy, A: Allocator + Clone> Producer<T, A> {
     /// Appends elements from slice to the ring buffer.
     /// Elements should be [`Copy`](https://doc.rust-lang.org/std/marker/trait.Copy.html).
     ///
@@ -234,7 +236,7 @@ impl<T: Sized + Copy> Producer<T> {
 }
 
 #[cfg(feature = "std")]
-impl Producer<u8> {
+impl<A: Allocator + Clone>  Producer<u8, A> {
     /// Reads at most `count` bytes
     /// from [`Read`](https://doc.rust-lang.org/std/io/trait.Read.html) instance
     /// and appends them to the ring buffer.
@@ -286,9 +288,9 @@ impl Producer<u8> {
 }
 
 #[cfg(feature = "std")]
-impl Write for Producer<u8> {
+impl<A: Allocator + Clone> Write for Producer<u8, A> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        loop {
+        loop_with_delay!({
             let n = self.push_slice(buffer);
             if n == 0 && self.is_consumer_alive() {
                 if !self.nonblocking {
@@ -306,7 +308,7 @@ impl Write for Producer<u8> {
             else {
                 return Ok(n);
             }
-        }
+        });
     }
 
     fn flush(&mut self) -> io::Result<()> {
