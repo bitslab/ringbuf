@@ -138,7 +138,7 @@ impl<T: Sized> Consumer<T> {
     ///
     /// *It's up to you to copy or drop appropriate elements if you use this function.*
     ///
-    pub unsafe fn pop_access<F>(&mut self, f: F) -> usize
+    pub unsafe fn pop_access<F>(&self, f: F) -> usize
     where
         F: FnOnce(&mut [MaybeUninit<T>], &mut [MaybeUninit<T>]) -> usize,
     {
@@ -180,7 +180,7 @@ impl<T: Sized> Consumer<T> {
     ///
     /// *You should manage copied elements after call, otherwise you may get a memory leak.*
     ///
-    pub unsafe fn pop_copy(&mut self, elems: &mut [MaybeUninit<T>]) -> usize {
+    pub unsafe fn pop_copy(&self, elems: &mut [MaybeUninit<T>]) -> usize {
         self.pop_access(|left, right| {
             if elems.len() < left.len() {
                 copy_nonoverlapping(left.as_ptr(), elems.as_mut_ptr(), elems.len());
@@ -339,26 +339,36 @@ impl<T: Sized + Copy> Consumer<T> {
     ///
     /// On success returns count of elements been copied from the ring buffer (or any saved buffers).
     pub fn pop_slice(&mut self, elems: &mut [T]) -> usize {
-        const SPIN_FIRST_CYCLES: u64 = 10_000; //TODO:(Jacob) Evaluate this choice of number
+        const SPIN_FIRST_CYCLES: u64 = 2_000_000;
+        let mut saved_buf_lock = self
+            .rb
+            .saved_buf
+            .spin_first_lock(SPIN_FIRST_CYCLES)
+            .unwrap();
+
         let mut bytes_read = 0usize;
         // First, read as many as we can from the actual ring buffer
         bytes_read += unsafe {
             self.pop_copy(&mut *(&mut elems[bytes_read..] as *mut [T] as *mut [MaybeUninit<T>]))
         };
 
+        if cfg!(feature = "debug-print") {
+            std::println!("[RINGBUF DEBUG] Reader pulled {bytes_read} bytes from the ring buffer");
+        }
+
         if cfg!(feature = "writer-sleep-copy") {
-            // TODO:(Jacob) Check if writer saved a buffer and do copy
-            let mut saved_buf_lock = self
-                .rb
-                .saved_buf
-                .spin_first_lock(SPIN_FIRST_CYCLES)
-                .unwrap();
             if let SavedBuffer::<T>::Writer(writer_buf) = *saved_buf_lock {
-                let copy_len = cmp::min(elems.len(), writer_buf.1);
+                *saved_buf_lock = SavedBuffer::Copying;
+
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Reader found a writer's saved buffer");
+                }
+
+                let copy_len = cmp::min(elems.len() - bytes_read, writer_buf.1);
                 unsafe {
                     std::intrinsics::copy_nonoverlapping(
                         writer_buf.0,
-                        elems.as_mut_ptr(),
+                        elems[bytes_read..].as_mut_ptr(),
                         copy_len,
                     );
                 }
@@ -367,6 +377,11 @@ impl<T: Sized + Copy> Consumer<T> {
                 if self.rb.num_sleepers.load(Ordering::Acquire) > 0 {
                     self.rb.cvar.notify_all();
                 }
+
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Reader copied {copy_len} bytes directly from the writer's saved buffer");
+                }
+
                 if bytes_read == elems.len() {
                     return bytes_read;
                 }
@@ -374,20 +389,20 @@ impl<T: Sized + Copy> Consumer<T> {
         }
 
         if cfg!(feature = "reader-sleep-copy") {
-            let mut saved_buf_lock = self
-                .rb
-                .saved_buf
-                .spin_first_lock(SPIN_FIRST_CYCLES)
-                .unwrap();
             if saved_buf_lock.is_none() {
                 // Set our buffer if noone else has theirs saved
-                *saved_buf_lock = SavedBuffer::Reader(elems.into());
+                *saved_buf_lock = SavedBuffer::Reader((&mut elems[bytes_read..]).into());
 
                 // Drop the guard
                 drop(saved_buf_lock);
 
                 // Spin and then eventually loop until we have been copied from
                 let mut num_copied = 0usize;
+
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Reader saved their buffer and is about to start waiting for a writer single-copy");
+                }
+
                 check_and_sleep(
                     &self.rb.saved_buf,
                     &self.rb.cvar,
@@ -396,6 +411,10 @@ impl<T: Sized + Copy> Consumer<T> {
                             num_copied = *n;
                             true
                         }
+                        _ => false,
+                    },
+                    |t| match t {
+                        SavedBuffer::Copying => true,
                         _ => false,
                     },
                     SPIN_FIRST_CYCLES,
@@ -408,10 +427,19 @@ impl<T: Sized + Copy> Consumer<T> {
                     .saved_buf
                     .spin_first_lock(SPIN_FIRST_CYCLES)
                     .unwrap() = SavedBuffer::None;
+
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Reader stopped waiting and found the writer copied {num_copied} bytes to our buffer");
+                }
+
                 if bytes_read == elems.len() {
                     return bytes_read;
                 }
             }
+        }
+
+        if cfg!(feature = "debug-print") {
+            std::println!("[RINGBUF DEBUG] Reader is about to return after successfully reading {bytes_read} bytes.");
         }
 
         bytes_read // Return what we were able to read

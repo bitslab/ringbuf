@@ -36,7 +36,7 @@ pub struct RingBuffer<T: Sized> {
     pub(crate) data: SharedVec<MaybeUninit<T>>,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
-    pub(crate) saved_buf: Mutex<SavedBuffer<T>>,
+    pub(crate) saved_buf: CachePadded<Mutex<SavedBuffer<T>>>,
     pub(crate) cvar: Condvar,
     pub(crate) num_sleepers: AtomicUsize,
 }
@@ -50,7 +50,7 @@ impl<T: Sized> RingBuffer<T> {
             data: SharedVec::new(data),
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
-            saved_buf: SavedBuffer::new_mutex(),
+            saved_buf: CachePadded::new(SavedBuffer::new_mutex()),
             cvar: Condvar::new(),
             num_sleepers: AtomicUsize::new(0),
         }
@@ -243,6 +243,7 @@ pub(crate) enum SavedBuffer<T: Sized> {
     Reader(MutBufferInfo<T>),
     Writer(BufferInfo<T>),
     Copied(usize),
+    Copying,
     None,
 }
 impl<T: Sized> Clone for SavedBuffer<T> {

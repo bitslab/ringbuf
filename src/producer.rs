@@ -81,7 +81,7 @@ impl<T: Sized> Producer<T> {
     ///
     /// The method gives access to ring buffer underlying memory which may be uninitialized.
     ///
-    pub unsafe fn push_access<F>(&mut self, f: F) -> usize
+    pub unsafe fn push_access<F>(&self, f: F) -> usize
     where
         F: FnOnce(&mut [MaybeUninit<T>], &mut [MaybeUninit<T>]) -> usize,
     {
@@ -130,7 +130,7 @@ impl<T: Sized> Producer<T> {
     ///
     /// *You should properly fill the slice and manage remaining elements after copy.*
     ///
-    pub unsafe fn push_copy(&mut self, elems: &[MaybeUninit<T>]) -> usize {
+    pub unsafe fn push_copy(&self, elems: &[MaybeUninit<T>]) -> usize {
         self.push_access(|left, right| -> usize {
             if elems.len() < left.len() {
                 copy_nonoverlapping(elems.as_ptr(), left.as_mut_ptr(), elems.len());
@@ -226,16 +226,23 @@ impl<T: Sized + Copy> Producer<T> {
     ///
     /// Returns count of elements been appended to the ring buffer.
     pub fn push_slice(&mut self, elems: &[T]) -> usize {
-        const SPIN_FIRST_CYCLES: u64 = 10_000; //TODO:(Jacob) Evaluate this choice of number
+        const SPIN_FIRST_CYCLES: u64 = 2_000_000;
+        let mut saved_buf_lock = self
+            .rb
+            .saved_buf
+            .spin_first_lock(SPIN_FIRST_CYCLES)
+            .unwrap();
+
         let mut bytes_written = 0usize;
         if cfg!(feature = "reader-sleep-copy") {
             // We need to check if the reader had a saved buffer
-            let mut saved_buf_lock = self
-                .rb
-                .saved_buf
-                .spin_first_lock(SPIN_FIRST_CYCLES)
-                .unwrap();
             if let SavedBuffer::<T>::Reader(reader_buf) = *saved_buf_lock {
+                *saved_buf_lock = SavedBuffer::Copying; // Let the reader know we are about to start copying so they don't go to sleep if they are currently spinning
+
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Writer found a reader's saved buffer");
+                }
+
                 // Reader had a saved buffer; copy to it
                 let reader_slice: &mut [T] = (&reader_buf).into();
                 let copy_len = cmp::min(elems.len(), reader_slice.len());
@@ -258,6 +265,12 @@ impl<T: Sized + Copy> Producer<T> {
                     self.rb.cvar.notify_all();
                 }
 
+                if cfg!(feature = "debug-print") {
+                    std::println!(
+                        "[RINGBUF DEBUG] Writer copied {copy_len} bytes directly from its buffer to a saved reader's buffer"
+                    );
+                }
+
                 // If we've written all the bytes we want written, return now
                 if bytes_written == elems.len() {
                     return bytes_written;
@@ -267,17 +280,18 @@ impl<T: Sized + Copy> Producer<T> {
 
         if cfg!(feature = "writer-sleep-copy") {
             // We still have more to write.
-            let mut guard = self
-                .rb
-                .saved_buf
-                .spin_first_lock(SPIN_FIRST_CYCLES)
-                .unwrap();
-            if guard.is_none() {
+            if saved_buf_lock.is_none() {
                 // Set our buffer if noone else has theirs saved
-                *guard = SavedBuffer::Writer(elems.into());
+                *saved_buf_lock = SavedBuffer::Writer(elems.into());
+
+                if cfg!(feature = "debug-print") {
+                    std::println!(
+                        "[RINGBUF DEBUG] Writer saved their buffer and is about to start waiting for a reader single-copy"
+                    );
+                }
 
                 // Drop the guard
-                drop(guard);
+                drop(saved_buf_lock);
 
                 // Spin and then eventually loop until we have been copied from
                 let mut num_copied = 0usize;
@@ -291,6 +305,10 @@ impl<T: Sized + Copy> Producer<T> {
                         }
                         _ => false,
                     },
+                    |t| match t {
+                        SavedBuffer::Copying => true,
+                        _ => false,
+                    },
                     SPIN_FIRST_CYCLES,
                     &self.rb.num_sleepers,
                 );
@@ -302,14 +320,26 @@ impl<T: Sized + Copy> Producer<T> {
                     .spin_first_lock(SPIN_FIRST_CYCLES)
                     .unwrap() = SavedBuffer::None;
 
+                if cfg!(feature = "debug-print") {
+                    std::println!("[RINGBUF DEBUG] Writer stopped waiting and found the reader copied {num_copied} bytes from our buffer");
+                }
+
                 if bytes_written == elems.len() {
                     return bytes_written;
                 }
             }
         }
 
+        if cfg!(feature = "debug-print") {
+            std::println!(
+                "[RINGBUF DEBUG] Writer is about to return after successfully single-copying {bytes_written} bytes and pushing the rest"
+            );
+        }
+
         bytes_written
-            + unsafe { self.push_copy(&*(elems as *const [T] as *const [MaybeUninit<T>])) }
+            + unsafe {
+                self.push_copy(&*(&elems[bytes_written..] as *const [T] as *const [MaybeUninit<T>]))
+            }
     }
 }
 

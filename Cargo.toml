@@ -19,6 +19,7 @@ std = []
 benchmark = []
 reader-sleep-copy = []
 writer-sleep-copy = []
+debug-print = []
 
 [[example]]
 name = "simple"
@@ -29,3 +30,4 @@ required-features = ["std"]
 [dependencies]
 cache-padded = "1.1.1"
 sync_spin = { path = './sync_spin' }
+libc = "0.2.80"
