@@ -29,6 +29,6 @@ impl<T> SpinFirst<T> for Mutex<T> {
                 Err(std::sync::TryLockError::Poisoned(e)) => return Err(e),
             }
         }
-        self.lock()
+        self.lock() // Fallback to sleeping
     }
 }

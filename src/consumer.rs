@@ -339,7 +339,7 @@ impl<T: Sized + Copy> Consumer<T> {
     ///
     /// On success returns count of elements been copied from the ring buffer (or any saved buffers).
     pub fn pop_slice(&mut self, elems: &mut [T]) -> usize {
-        const SPIN_FIRST_CYCLES: u64 = 2_000_000;
+        const SPIN_FIRST_CYCLES: u64 = 10_000_000;
         let mut saved_buf_lock = self
             .rb
             .saved_buf
@@ -393,40 +393,35 @@ impl<T: Sized + Copy> Consumer<T> {
                 // Set our buffer if noone else has theirs saved
                 *saved_buf_lock = SavedBuffer::Reader((&mut elems[bytes_read..]).into());
 
-                // Drop the guard
-                drop(saved_buf_lock);
-
                 // Spin and then eventually loop until we have been copied from
-                let mut num_copied = 0usize;
-
                 if cfg!(feature = "debug-print") {
                     std::println!("[RINGBUF DEBUG] Reader saved their buffer and is about to start waiting for a writer single-copy");
                 }
 
-                check_and_sleep(
+                let num_copied = saved_buf_lock.spin_then_sleep(
                     &self.rb.saved_buf,
-                    &self.rb.cvar,
-                    |t| match t {
-                        SavedBuffer::Copied(n) => {
-                            num_copied = *n;
-                            true
-                        }
-                        _ => false,
-                    },
-                    |t| match t {
-                        SavedBuffer::Copying => true,
-                        _ => false,
-                    },
-                    SPIN_FIRST_CYCLES,
                     &self.rb.num_sleepers,
+                    SPIN_FIRST_CYCLES,
                 );
+
+                // check_and_sleep(
+                //     &self.rb.saved_buf,
+                //     &self.rb.cvar,
+                //     |t| match t {
+                //         SavedBuffer::Copied(n) => {
+                //             num_copied = *n;
+                //             true
+                //         }
+                //         _ => false,
+                //     },
+                //     |t| match t {
+                //         SavedBuffer::Copying => true,
+                //         _ => false,
+                //     },
+                //     SPIN_FIRST_CYCLES,
+                //     &self.rb.num_sleepers,
+                // );
                 bytes_read += num_copied;
-                // Reset saved buffer to none
-                *self
-                    .rb
-                    .saved_buf
-                    .spin_first_lock(SPIN_FIRST_CYCLES)
-                    .unwrap() = SavedBuffer::None;
 
                 if cfg!(feature = "debug-print") {
                     std::println!("[RINGBUF DEBUG] Reader stopped waiting and found the writer copied {num_copied} bytes to our buffer");

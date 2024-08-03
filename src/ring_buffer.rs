@@ -8,7 +8,10 @@ use core::{
     ptr::{self, copy},
     sync::atomic::{AtomicUsize, Ordering},
 };
-use std::sync::{Condvar, Mutex};
+use libc::{syscall, timespec, SYS_futex, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, INT_MAX};
+use std::ptr::addr_of_mut;
+use std::sync::{Condvar, Mutex, MutexGuard};
+use sync_spin::mutex_spin::SpinFirst;
 
 pub(crate) struct SharedVec<T: Sized> {
     cell: UnsafeCell<Vec<T>>,
@@ -239,13 +242,16 @@ impl<T: Sized> From<&mut [T]> for MutBufferInfo<T> {
 
 /// Enum which tracks saved buffer info
 #[derive(Debug)]
+#[repr(u32)]
 pub(crate) enum SavedBuffer<T: Sized> {
-    Reader(MutBufferInfo<T>),
-    Writer(BufferInfo<T>),
-    Copied(usize),
-    Copying,
-    None,
+    Reader(MutBufferInfo<T>) = 0,
+    Writer(BufferInfo<T>) = 1,
+    Copied(usize) = 2,
+    Copying = 3,
+    None = 4,
 }
+
+unsafe impl<T: Sized> Send for SavedBuffer<T> {}
 impl<T: Sized> Clone for SavedBuffer<T> {
     fn clone(&self) -> Self {
         *self
@@ -254,6 +260,12 @@ impl<T: Sized> Clone for SavedBuffer<T> {
 impl<T: Sized> Copy for SavedBuffer<T> {}
 
 impl<T: Sized> SavedBuffer<T> {
+    pub const READER: u32 = 0;
+    pub const WRITER: u32 = 1;
+    pub const COPIED: u32 = 2;
+    pub const COPYING: u32 = 3;
+    pub const NONE: u32 = 4;
+
     pub fn new_mutex() -> Mutex<Self> {
         Mutex::new(Self::None)
     }
@@ -265,6 +277,139 @@ impl<T: Sized> SavedBuffer<T> {
     pub fn is_some(&self) -> bool {
         !matches!(self, SavedBuffer::None)
     }
+
+    pub fn discriminant(&self) -> u32 {
+        unsafe { *self.discriminant_addr() }
+    }
+
+    fn discriminant_addr(&self) -> *mut u32 {
+        self as *const Self as *mut u32
+    }
+
+    /// Wakes all threads sleeping on the determinant_addr of this enum
+    pub fn futex_wake(&self) {
+        let det_addr = self.discriminant_addr();
+        futex(
+            det_addr,
+            FUTEX_PRIVATE_FLAG | FUTEX_WAKE,
+            INT_MAX as _,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
 }
 
-unsafe impl<T: Sized> Send for SavedBuffer<T> {}
+fn futex(
+    uaddr: *mut u32,
+    futex_op: i32,
+    val: u32,
+    timeout: *const timespec,
+    uaddr2: *mut u32,
+    val3: u32,
+) -> i64 {
+    unsafe { syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3) }
+}
+
+pub trait SavedBufferMutexGuardFutexSleep<T> {
+    fn futex_sleep(self);
+    fn spin_then_sleep(
+        self,
+        mutex: &Mutex<SavedBuffer<T>>,
+        num_sleepers: &AtomicUsize,
+        spin_cycles: u64,
+    ) -> usize;
+}
+
+impl<T> SavedBufferMutexGuardFutexSleep<T> for MutexGuard<'_, SavedBuffer<T>> {
+    #[inline(always)]
+    fn futex_sleep(self) {
+        let det = self.discriminant();
+        let det_addr = self.discriminant_addr();
+        drop(self);
+
+        // Only go to sleep if determinant_addr still has the currently observed determinant value
+        while det == unsafe { *det_addr } {
+            futex(
+                det_addr,
+                FUTEX_PRIVATE_FLAG | FUTEX_WAIT,
+                det,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+    }
+
+    /// # Parameters
+    /// `mutex` - A reference to the mutex from which the guard `self` was created
+    /// `num_sleepers` - A reference to an atomic to count the number of sleeping threads for this SavedBuffer
+    /// `spin_cycles` - How many cycles to spin before going to sleep with a futex call
+    /// # Return Value
+    /// Returns the number of bytes copied in a single copy.
+    fn spin_then_sleep(
+        self,
+        mutex: &Mutex<SavedBuffer<T>>,
+        num_sleepers: &AtomicUsize,
+        spin_cycles: u64,
+    ) -> usize {
+        const SPIN_FIRST_CYCLES: u64 = 2_000_000;
+
+        let start = rdtscp();
+        let mut self_ref = self;
+        let mut no_sleep = false;
+        loop {
+            // Check guard status
+            if let SavedBuffer::Copied(n) = *self_ref {
+                // Reset SavedBuffer to None
+                *self_ref = SavedBuffer::None;
+                return n;
+            }
+            no_sleep = matches!(*self_ref, SavedBuffer::Copying);
+
+            // Drop our guard to give other threads a chance to update the
+            drop(self_ref);
+
+            // See if it's time to stop spinning and sleep
+            if !no_sleep && rdtscp() > start + spin_cycles {
+                break;
+            }
+
+            // Spin for a bit
+            for _ in 0..2 {
+                std::hint::spin_loop(); // x86-64 "pause" instruction
+            }
+
+            // Grab the guard again
+            self_ref = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
+        }
+
+        // It's time to sleep :(
+        num_sleepers.fetch_add(1, Ordering::Relaxed);
+        self_ref = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
+        let disc_addr = self_ref.discriminant_addr();
+        while unsafe { *disc_addr } != SavedBuffer::<T>::COPIED
+            && unsafe { *disc_addr } != SavedBuffer::<T>::COPYING
+        {
+            mutex
+                .spin_first_lock(SPIN_FIRST_CYCLES)
+                .unwrap()
+                .futex_sleep();
+        }
+        num_sleepers.fetch_sub(1, Ordering::Relaxed);
+        self_ref = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
+        if let SavedBuffer::<T>::Copied(n) = *self_ref {
+            *self_ref = SavedBuffer::None;
+            n
+        } else {
+            panic!("Enum determinant indicated SavedBuffer::Copied state but found something else!")
+        }
+    }
+}
+
+#[allow(non_upper_case_globals)]
+#[inline(always)]
+fn rdtscp() -> u64 {
+    static mut dummy: u32 = 0;
+    unsafe { core::arch::x86_64::__rdtscp(addr_of_mut!(dummy)) }
+}

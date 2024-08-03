@@ -8,6 +8,7 @@ pub mod mutex_spin;
 use mutex_spin::SpinFirst;
 
 #[allow(non_upper_case_globals)]
+#[inline(always)]
 fn rdtscp() -> u64 {
     static mut dummy: u32 = 0;
     unsafe { core::arch::x86_64::__rdtscp(addr_of_mut!(dummy)) }

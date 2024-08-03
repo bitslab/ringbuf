@@ -262,7 +262,8 @@ impl<T: Sized + Copy> Producer<T> {
 
                 // Use Condvar to wake the reader if they are actually asleep (and not spinning)
                 if self.rb.num_sleepers.load(Ordering::Acquire) > 0 {
-                    self.rb.cvar.notify_all();
+                    // There may or may not be a thread actually sleeping
+                    saved_buf_lock.futex_wake();
                 }
 
                 if cfg!(feature = "debug-print") {
