@@ -8,6 +8,7 @@ use core::{
 };
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+use std::mem::size_of;
 use sync_spin::{check_and_sleep, mutex_spin::SpinFirst};
 
 use crate::{producer::Producer, ring_buffer::*};
@@ -366,16 +367,21 @@ impl<T: Sized + Copy> Consumer<T> {
 
                 let copy_len = cmp::min(elems.len() - bytes_read, writer_buf.1);
                 unsafe {
-                    std::intrinsics::copy_nonoverlapping(
-                        writer_buf.0,
-                        elems[bytes_read..].as_mut_ptr(),
-                        copy_len,
+                    // std::intrinsics::copy_nonoverlapping(
+                    //     writer_buf.0,
+                    //     elems[bytes_read..].as_mut_ptr(),
+                    //     copy_len,
+                    // );
+                    my_memcpy(
+                        elems[bytes_read..].as_mut_ptr() as _,
+                        writer_buf.0 as _,
+                        copy_len * size_of::<T>(),
                     );
                 }
                 *saved_buf_lock = SavedBuffer::Copied(copy_len);
                 bytes_read += copy_len;
                 if self.rb.num_sleepers.load(Ordering::Acquire) > 0 {
-                    self.rb.cvar.notify_all();
+                    saved_buf_lock.futex_wake();
                 }
 
                 if cfg!(feature = "debug-print") {

@@ -7,6 +7,7 @@ use core::{
 use std::cmp;
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+use std::mem::size_of;
 use sync_spin::{check_and_sleep, mutex_spin::SpinFirst};
 
 use crate::{consumer::Consumer, ring_buffer::*};
@@ -226,7 +227,7 @@ impl<T: Sized + Copy> Producer<T> {
     ///
     /// Returns count of elements been appended to the ring buffer.
     pub fn push_slice(&mut self, elems: &[T]) -> usize {
-        const SPIN_FIRST_CYCLES: u64 = 2_000_000;
+        const SPIN_FIRST_CYCLES: u64 = 10_000_000;
         let mut saved_buf_lock = self
             .rb
             .saved_buf
@@ -247,7 +248,12 @@ impl<T: Sized + Copy> Producer<T> {
                 let reader_slice: &mut [T] = (&reader_buf).into();
                 let copy_len = cmp::min(elems.len(), reader_slice.len());
                 unsafe {
-                    std::intrinsics::copy_nonoverlapping(elems.as_ptr(), reader_buf.0, copy_len);
+                    // std::intrinsics::copy_nonoverlapping(elems.as_ptr(), reader_buf.0, copy_len);
+                    my_memcpy(
+                        reader_buf.0 as _,
+                        elems.as_ptr() as _,
+                        copy_len * size_of::<T>(),
+                    );
                 }
 
                 // Overwrite the enum for the saved buffer we just wrote to with the number of bytes we wrote
@@ -291,29 +297,13 @@ impl<T: Sized + Copy> Producer<T> {
                     );
                 }
 
-                // Drop the guard
-                drop(saved_buf_lock);
-
-                // Spin and then eventually loop until we have been copied from
-                let mut num_copied = 0usize;
-                check_and_sleep(
+                let num_copied = saved_buf_lock.spin_then_sleep(
                     &self.rb.saved_buf,
-                    &self.rb.cvar,
-                    |t| match t {
-                        SavedBuffer::Copied(n) => {
-                            num_copied = *n;
-                            true
-                        }
-                        _ => false,
-                    },
-                    |t| match t {
-                        SavedBuffer::Copying => true,
-                        _ => false,
-                    },
-                    SPIN_FIRST_CYCLES,
                     &self.rb.num_sleepers,
+                    SPIN_FIRST_CYCLES,
                 );
                 bytes_written += num_copied;
+
                 // Reset saved buffer to none
                 *self
                     .rb

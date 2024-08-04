@@ -1,6 +1,7 @@
 use crate::{consumer::Consumer, producer::Producer};
 use alloc::{sync::Arc, vec::Vec};
 use cache_padded::CachePadded;
+use core::arch::x86_64::*;
 use core::{
     cell::UnsafeCell,
     cmp::min,
@@ -282,8 +283,8 @@ impl<T: Sized> SavedBuffer<T> {
         unsafe { *self.discriminant_addr() }
     }
 
-    fn discriminant_addr(&self) -> *mut u32 {
-        self as *const Self as *mut u32
+    fn discriminant_addr(&self) -> *const u32 {
+        self as *const Self as *const u32
     }
 
     /// Wakes all threads sleeping on the determinant_addr of this enum
@@ -301,7 +302,7 @@ impl<T: Sized> SavedBuffer<T> {
 }
 
 fn futex(
-    uaddr: *mut u32,
+    uaddr: *const u32,
     futex_op: i32,
     val: u32,
     timeout: *const timespec,
@@ -311,7 +312,7 @@ fn futex(
     unsafe { syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3) }
 }
 
-pub trait SavedBufferMutexGuardFutexSleep<T> {
+pub(crate) trait SavedBufferMutexGuardFutexSleep<T> {
     fn futex_sleep(self);
     fn spin_then_sleep(
         self,
@@ -357,7 +358,7 @@ impl<T> SavedBufferMutexGuardFutexSleep<T> for MutexGuard<'_, SavedBuffer<T>> {
 
         let start = rdtscp();
         let mut self_ref = self;
-        let mut no_sleep = false;
+        let mut no_sleep;
         loop {
             // Check guard status
             if let SavedBuffer::Copied(n) = *self_ref {
@@ -412,4 +413,40 @@ impl<T> SavedBufferMutexGuardFutexSleep<T> for MutexGuard<'_, SavedBuffer<T>> {
 fn rdtscp() -> u64 {
     static mut dummy: u32 = 0;
     unsafe { core::arch::x86_64::__rdtscp(addr_of_mut!(dummy)) }
+}
+
+pub(crate) unsafe fn my_memcpy(dest: *mut u8, src: *const u8, n: usize) {
+    let mut i = 0;
+    // Start with 256-bit registers (skipping AVX512, since they lower the CPU clock speed)
+    while i + 32 <= n {
+        let src_ptr = src.add(i) as *const __m256i;
+        let dest_ptr = dest.add(i) as *mut __m256i;
+
+        // Load 32 src bytes
+        let data = _mm256_loadu_si256(src_ptr);
+
+        // Store 32 dest bytes
+        _mm256_storeu_si256(dest_ptr, data);
+
+        i += 32;
+    }
+
+    // Now, use 128-bit vector registers if we can
+    while i + 16 <= n {
+        let src_ptr = src.add(i) as *const __m128i;
+        let dest_ptr = dest.add(i) as *mut __m128i;
+
+        // Load 16 src bytes
+        let data = _mm_loadu_si128(src_ptr);
+
+        _mm_storeu_si128(dest_ptr, data);
+
+        i += 16;
+    }
+
+    // Finally, copy remaining bytes one-by-one
+    while i < n {
+        *dest.add(i) = *src.add(i);
+        i += 1;
+    }
 }
