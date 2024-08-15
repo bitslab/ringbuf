@@ -42,7 +42,7 @@ pub fn check_and_sleep<T, F: FnMut(&T) -> bool, R: FnMut(&T) -> bool>(
     // Spin loop
     loop {
         {
-            let guard = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
+            let guard = mutex.spin_lock().unwrap();
             if condition(&*guard) {
                 // Didn't need to sleep. Condition met
                 return;
@@ -70,7 +70,7 @@ pub fn check_and_sleep<T, F: FnMut(&T) -> bool, R: FnMut(&T) -> bool>(
 
     // No more condvar here.
 
-    let mut guard = mutex.spin_first_lock(SPIN_FIRST_CYCLES).unwrap();
+    let mut guard = mutex.spin_lock().unwrap();
     while !condition(&*guard) {
         guard = condvar.wait(guard).unwrap();
     }
