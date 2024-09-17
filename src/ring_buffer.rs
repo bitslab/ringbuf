@@ -1,11 +1,17 @@
 use crate::{consumer::Consumer, producer::Producer};
-use std::alloc::{Allocator, Global};
 use alloc::{sync::Arc, vec::Vec};
 use cache_padded::CachePadded;
-use rand;
 use core::{
-    alloc::GlobalAlloc, cell::UnsafeCell, cmp::min, mem::MaybeUninit, ptr::{self, copy}, sync::atomic::{AtomicUsize, Ordering}
+    alloc::GlobalAlloc,
+    cell::UnsafeCell,
+    cmp::min,
+    mem::MaybeUninit,
+    ptr::{self, copy},
+    sync::atomic::{AtomicUsize, Ordering},
 };
+use rand;
+use std::alloc::{Allocator, Global};
+use std::sync::Mutex;
 
 pub(crate) struct SharedVec<T: Sized, A: Allocator + Clone> {
     cell: UnsafeCell<Vec<T, A>>,
@@ -50,16 +56,17 @@ impl<T: Sized, A: Allocator + Clone> SharedVec<T, A> {
 }
 
 /// Ring buffer itself.
-pub struct RingBuffer<T: Sized, A: Allocator + Clone=Global> {
+pub struct RingBuffer<T: Sized, A: Allocator + Clone = Global> {
     pub(crate) data: SharedVec<MaybeUninit<T>, A>,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
+    pub write_end_closed: Mutex<bool>,
     alloc: A,
 }
 
-impl <T: Sized> RingBuffer<T, Global> {
+impl<T: Sized> RingBuffer<T, Global> {
     pub fn new_global(capacity: usize) -> Self {
-        RingBuffer::new(capacity, Global{})
+        RingBuffer::new(capacity, Global {})
     }
 }
 
@@ -70,12 +77,13 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
         data.resize_with(capacity + 1, MaybeUninit::uninit);
         let start = {
             (rand::random::<usize>() % capacity) & // select a start byte from the buffer
-            (!0b0111111)                           // cache align it
+            (!0b0111111) // cache align it
         };
         Self {
             data: SharedVec::new(data),
             head: CachePadded::new(AtomicUsize::new(start)),
             tail: CachePadded::new(AtomicUsize::new(start)),
+            write_end_closed: Mutex::new(false),
             alloc: alloc,
         }
     }
@@ -84,7 +92,16 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
     pub fn split(self) -> (Producer<T, A>, Consumer<T, A>) {
         let alloc = self.alloc.clone();
         let arc: Arc<RingBuffer<T, A>, A> = Arc::new_in(self, alloc);
-        (Producer { rb: arc.clone(), nonblocking: false}, Consumer { rb: arc, nonblocking: false})
+        (
+            Producer {
+                rb: arc.clone(),
+                nonblocking: false,
+            },
+            Consumer {
+                rb: arc,
+                nonblocking: false,
+            },
+        )
     }
 
     /// Returns capacity of the ring buffer.
@@ -175,7 +192,11 @@ impl<T> SlicePtr<T> {
 /// `count` is the number of items being moved, if `None` - as much as possible items will be moved.
 ///
 /// Returns number of items been moved.
-pub fn move_items<T, A: Allocator + Clone>(src: &mut Consumer<T, A>, dst: &mut Producer<T, A>, count: Option<usize>) -> usize {
+pub fn move_items<T, A: Allocator + Clone>(
+    src: &mut Consumer<T, A>,
+    dst: &mut Producer<T, A>,
+    count: Option<usize>,
+) -> usize {
     unsafe {
         src.pop_access(|src_left, src_right| -> usize {
             dst.push_access(|dst_left, dst_right| -> usize {

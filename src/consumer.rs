@@ -1,4 +1,4 @@
-use std::alloc::Allocator;
+use crate::{producer::Producer, ring_buffer::*};
 use alloc::sync::Arc;
 use core::{
     cmp::{self, min},
@@ -7,15 +7,15 @@ use core::{
     ptr::copy_nonoverlapping,
     sync::atomic,
 };
+use std::alloc::Allocator;
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
-use crate::{producer::Producer, ring_buffer::*};
 
 use crate::loop_with_delay;
 /// Consumer part of ring buffer.
 pub struct Consumer<T, A: Allocator + Clone> {
     pub(crate) rb: Arc<RingBuffer<T, A>, A>,
-    pub(crate) nonblocking: bool
+    pub(crate) nonblocking: bool,
 }
 
 impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
@@ -49,16 +49,15 @@ impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
 
     /// Checks if the producer end is still present.
     pub fn is_producer_alive(&self) -> bool {
-      if Arc::strong_count(&self.rb) >= 2 {
-        true
-      }
-      else {
-        false
-      }
+        if Arc::strong_count(&self.rb) >= 2 {
+            true
+        } else {
+            false
+        }
     }
 
     pub fn set_nonblocking(&mut self) {
-      self.nonblocking = true;
+        self.nonblocking = true;
     }
 
     /// The remaining space in the buffer.
@@ -410,16 +409,20 @@ impl<A: Allocator + Clone> Read for Consumer<u8, A> {
             let n = self.pop_slice(buffer);
             if n == 0 && self.is_producer_alive() {
                 if !self.nonblocking {
+                    let mut write_end_closed_guard = self.rb.write_end_closed.lock().unwrap();
+                    if *write_end_closed_guard {
+                        *write_end_closed_guard = false;
+                        return Ok(0);
+                    }
                     continue;
-                }
-                else {
+                } else {
                     return Err(io::ErrorKind::WouldBlock.into());
                 }
             }
             /*
             else if n == 0 && !self.is_producer_alive() {
                 return Err(io::ErrorKind::NotFound.into());
-            } 
+            }
             */
             else {
                 return Ok(n);
