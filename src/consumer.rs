@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use crate::loop_with_delay;
 /// Consumer part of ring buffer.
 pub struct Consumer<T, A: Allocator + Clone> {
-    pub(crate) rb: Arc<RingBuffer<T, A>, A>,
+    pub rb: Arc<RingBuffer<T, A>, A>,
     pub(crate) nonblocking: bool,
 }
 
@@ -410,7 +410,9 @@ impl<A: Allocator + Clone> Read for Consumer<u8, A> {
             if n == 0 && self.is_producer_alive() {
                 if !self.nonblocking {
                     // TODO: (Jacob) Evaluate if acquire ordering is needed here
-                    if self.rb.write_ends_open.load(Ordering::Acquire) == 0 {
+                    let tmp_remove_me = self.rb.write_ends_open.load(Ordering::Acquire);
+                    // std::dbg!(&tmp_remove_me);
+                    if tmp_remove_me == 0 {
                         std::println!("[\x1b[1;2;34mCOMPOUND\x1b[0m] ringbuf::Consumer::read returning 0 because write_end_closed was true!");
                         return Ok(0);
                     }
