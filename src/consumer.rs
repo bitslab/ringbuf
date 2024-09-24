@@ -5,7 +5,7 @@ use core::{
     mem::{self, MaybeUninit},
     ops::Range,
     ptr::copy_nonoverlapping,
-    sync::atomic,
+    sync::atomic::{self, Ordering},
 };
 use std::alloc::Allocator;
 #[cfg(feature = "std")]
@@ -409,9 +409,9 @@ impl<A: Allocator + Clone> Read for Consumer<u8, A> {
             let n = self.pop_slice(buffer);
             if n == 0 && self.is_producer_alive() {
                 if !self.nonblocking {
-                    let mut write_end_closed_guard = self.rb.write_end_closed.lock().unwrap();
-                    if *write_end_closed_guard {
-                        *write_end_closed_guard = false;
+                    // TODO: (Jacob) Evaluate if acquire ordering is needed here
+                    if self.rb.write_ends_open.load(Ordering::Acquire) == 0 {
+                        std::println!("[\x1b[1;2;34mCOMPOUND\x1b[0m] ringbuf::Consumer::read returning 0 because write_end_closed was true!");
                         return Ok(0);
                     }
                     continue;

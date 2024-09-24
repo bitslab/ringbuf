@@ -60,7 +60,7 @@ pub struct RingBuffer<T: Sized, A: Allocator + Clone = Global> {
     pub(crate) data: SharedVec<MaybeUninit<T>, A>,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
-    pub write_end_closed: Mutex<bool>,
+    pub write_ends_open: CachePadded<AtomicUsize>,
     alloc: A,
 }
 
@@ -83,7 +83,7 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
             data: SharedVec::new(data),
             head: CachePadded::new(AtomicUsize::new(start)),
             tail: CachePadded::new(AtomicUsize::new(start)),
-            write_end_closed: Mutex::new(false),
+            write_ends_open: CachePadded::new(AtomicUsize::new(1)),
             alloc: alloc,
         }
     }
