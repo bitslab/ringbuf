@@ -293,6 +293,7 @@ impl<A: Allocator + Clone> Write for Producer<u8, A> {
             let n = self.push_slice(buffer);
             if n == 0 && self.is_consumer_alive() {
                 if !self.nonblocking {
+                    std::println!("[COMPOUND DEBUG] Writer blocking!!");
                     continue;
                 } else {
                     return Err(io::ErrorKind::WouldBlock.into());

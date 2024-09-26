@@ -400,25 +400,45 @@ impl<A: Allocator + Clone> Consumer<u8, A> {
             None => Ok(n),
         }
     }
+
+    pub fn pipe_read(&mut self, fd: i32, buffer: &mut [u8]) -> io::Result<usize> {
+        loop_with_delay!({
+            if !self.is_producer_alive() {
+                return Ok(0);
+            }
+            let n = self.pop_slice(buffer);
+            if n == 0 && self.is_producer_alive() {
+                if self.nonblocking {
+                    return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
+                } else {
+                    continue;
+                }
+            }
+            /*
+            else if n == 0 && !self.is_producer_alive() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            */
+            else {
+                return Ok(n);
+            }
+        })
+    }
 }
 
 #[cfg(feature = "std")]
 impl<A: Allocator + Clone> Read for Consumer<u8, A> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         loop_with_delay!({
+            if !self.is_producer_alive() {
+                return Ok(0);
+            }
             let n = self.pop_slice(buffer);
             if n == 0 && self.is_producer_alive() {
-                if !self.nonblocking {
-                    // TODO: (Jacob) Evaluate if acquire ordering is needed here
-                    let tmp_remove_me = self.rb.write_ends_open.load(Ordering::Acquire);
-                    // std::dbg!(&tmp_remove_me);
-                    if tmp_remove_me == 0 {
-                        std::println!("[\x1b[1;2;34mCOMPOUND\x1b[0m] ringbuf::Consumer::read returning 0 because write_end_closed was true!");
-                        return Ok(0);
-                    }
-                    continue;
+                if self.nonblocking {
+                    return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
                 } else {
-                    return Err(io::ErrorKind::WouldBlock.into());
+                    continue;
                 }
             }
             /*

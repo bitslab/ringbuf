@@ -26,4 +26,6 @@ required-features = ["std"]
 
 [dependencies]
 cache-padded = "1.1.1"
+common.path = "../common"
 rand = "*"
+libc.workspace = true
