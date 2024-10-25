@@ -11,7 +11,7 @@ use core::{
 };
 use rand;
 use std::alloc::{Allocator, Global};
-use std::sync::Mutex;
+use std::sync::{Mutex, Condvar};
 
 pub(crate) struct SharedVec<T: Sized, A: Allocator + Clone> {
     cell: UnsafeCell<Vec<T, A>>,
@@ -60,7 +60,9 @@ pub struct RingBuffer<T: Sized, A: Allocator + Clone = Global> {
     pub(crate) data: SharedVec<MaybeUninit<T>, A>,
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
-    alloc: A,
+    pub(crate) reader_waiter: Condvar,
+    pub(crate) writer_waiter: Condvar,
+    pub(crate) alloc: A,
 }
 
 impl<T: Sized> RingBuffer<T, Global> {
@@ -82,6 +84,8 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
             data: SharedVec::new(data),
             head: CachePadded::new(AtomicUsize::new(start)),
             tail: CachePadded::new(AtomicUsize::new(start)),
+            reader_waiter: Condvar::new(),
+            writer_waiter: Condvar::new(),
             alloc: alloc,
         }
     }

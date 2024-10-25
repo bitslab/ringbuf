@@ -1,5 +1,6 @@
 use crate::{producer::Producer, ring_buffer::*};
 use alloc::sync::Arc;
+use std::sync::MutexGuard;
 use core::{
     cmp::{self, min},
     mem::{self, MaybeUninit},
@@ -16,6 +17,23 @@ use crate::loop_with_delay;
 pub struct Consumer<T, A: Allocator + Clone> {
     pub rb: Arc<RingBuffer<T, A>, A>,
     pub(crate) nonblocking: bool,
+}
+
+/* TODO:(Jacob) EXTREME: YOU NEED TO MAKE THIS A NOT-CLONE-IMPL FUNCTION, 
+ * NAME IT SOMETHING DANGEROUS SOUNDING, 
+ * AND MAKE THAT FUNCTION UNSAFE! */
+impl<T, A: Allocator + Clone> Clone for Consumer<T, A> {
+    fn clone(&self) -> Self {
+        let rb_arc_clone = self.rb.clone();
+        // Manually decrement this Arc's strong count. Oh god what am I doing
+        let rb_arc_raw = Arc::into_raw(rb_arc_clone);
+        unsafe { Arc::decrement_strong_count(rb_arc_raw) };
+        let rb_arc_clone = unsafe { Arc::from_raw_in(rb_arc_raw, self.rb.alloc.clone()) };
+        Self {
+            rb: rb_arc_clone,
+            nonblocking: self.nonblocking
+        }
+    }
 }
 
 impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
@@ -49,6 +67,8 @@ impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
 
     /// Checks if the producer end is still present.
     pub fn is_producer_alive(&self) -> bool {
+        std::println!("Arc strong count: {}", Arc::strong_count(&self.rb));
+        std::thread::sleep_ms(1000);
         if Arc::strong_count(&self.rb) >= 2 {
             true
         } else {
@@ -438,6 +458,7 @@ impl<A: Allocator + Clone> Read for Consumer<u8, A> {
                 if self.nonblocking {
                     return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
                 } else {
+                    std::println!("[DEBUG] Reader is spinning!");
                     continue;
                 }
             }
