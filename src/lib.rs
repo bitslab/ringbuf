@@ -63,6 +63,7 @@ mod tests;
 mod consumer;
 mod producer;
 mod ring_buffer;
+mod debug_arc_wrapper;
 
 pub use consumer::*;
 pub use producer::*;

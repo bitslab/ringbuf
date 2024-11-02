@@ -17,6 +17,12 @@ pub struct Producer<T, A: Allocator + Clone> {
     pub(crate) nonblocking: bool,
 }
 
+//impl<T, A: Allocator + Clone> Drop for Producer<T, A> {
+//    fn drop(&mut self) {
+//        std::println!("\n\x1b[1;34m[Thread {}]\x1b[0m ringbuf Producer being dropped!", unsafe { libc::gettid() });
+//    }
+//}
+
 impl<T: Sized, A: Allocator + Clone> Producer<T, A> {
     /// Returns capacity of the ring buffer.
     ///

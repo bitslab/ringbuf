@@ -140,6 +140,7 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
 
 impl<T: Sized, A: Allocator + Clone> Drop for RingBuffer<T, A> {
     fn drop(&mut self) {
+        std::println!("Drop impl called for RingBuffer");
         let data = unsafe { self.data.get_mut() };
 
         let head = self.head.load(Ordering::Acquire);

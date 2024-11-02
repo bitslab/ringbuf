@@ -1,5 +1,7 @@
 use crate::{producer::Producer, ring_buffer::*};
 use alloc::sync::Arc;
+use std::ops::{Deref, DerefMut};
+use std::mem::ManuallyDrop;
 use std::sync::MutexGuard;
 use core::{
     cmp::{self, min},
@@ -19,20 +21,74 @@ pub struct Consumer<T, A: Allocator + Clone> {
     pub(crate) nonblocking: bool,
 }
 
+//impl<T, A: Allocator + Clone> Drop for Consumer<T, A> {
+//    fn drop(&mut self) {
+//        std::println!("\n\x1b[1;34m[Thread {}]\x1b[0m ringbuf Consumer being dropped!", unsafe { libc::gettid() });
+//    }
+//}
+
 /* TODO:(Jacob) EXTREME: YOU NEED TO MAKE THIS A NOT-CLONE-IMPL FUNCTION, 
  * NAME IT SOMETHING DANGEROUS SOUNDING, 
  * AND MAKE THAT FUNCTION UNSAFE! */
-impl<T, A: Allocator + Clone> Clone for Consumer<T, A> {
-    fn clone(&self) -> Self {
+//impl<T, A: Allocator + Clone> Clone for Consumer<T, A> {
+//    fn clone(&self) -> Self {
+//        let rb_arc_clone = self.rb.clone();
+//        // Manually decrement this Arc's strong count. Oh god what am I doing
+//        //let rb_arc_raw = Arc::into_raw(rb_arc_clone);
+//        //unsafe { Arc::decrement_strong_count(rb_arc_raw) };
+//        //let rb_arc_clone = unsafe { Arc::from_raw_in(rb_arc_raw, self.rb.alloc.clone()) };
+//        Self {
+//            rb: rb_arc_clone,
+//            nonblocking: self.nonblocking
+//        }
+//    }
+//}
+
+/// Struct returned by `UnsafeConsumerClone::clone_without_arc_increment`. Derefs to `T` but will not drop `T` when it gets dropped
+pub struct ArcCloneNoDecr<T> {
+    inner: ManuallyDrop<T>
+}
+
+impl<T> Deref for ArcCloneNoDecr<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for ArcCloneNoDecr<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<T> ArcCloneNoDecr<T> {
+    /// Construct an [`ArcCloneNoDecr`] a moved `value: T`
+    pub fn from(value: T) -> Self {
+        Self {
+            inner: ManuallyDrop::new(value)
+        }
+    }
+}
+
+// Force callers to use trait as well, making it harder to accidentally call
+pub trait UnsafeConsumerClone: Sized {
+    unsafe fn clone_without_arc_increment(&self) -> ArcCloneNoDecr<Self>;
+}
+
+impl<T: Sized, A: Allocator + Clone> UnsafeConsumerClone for Consumer<T, A> {
+    unsafe fn clone_without_arc_increment(&self) -> ArcCloneNoDecr<Self> {
         let rb_arc_clone = self.rb.clone();
-        // Manually decrement this Arc's strong count. Oh god what am I doing
+
+        // Manually decrement this Arc's strong count so the net change for the clone is 0.
+        // SAFETY: This arc will only be used temporarily for a blocking read call. During that time there will always the parent Arc<Mutex<File>> so the strong count will never drop to zero.
         let rb_arc_raw = Arc::into_raw(rb_arc_clone);
         unsafe { Arc::decrement_strong_count(rb_arc_raw) };
         let rb_arc_clone = unsafe { Arc::from_raw_in(rb_arc_raw, self.rb.alloc.clone()) };
-        Self {
+        ArcCloneNoDecr::from(Self {
             rb: rb_arc_clone,
             nonblocking: self.nonblocking
-        }
+        })
     }
 }
 
