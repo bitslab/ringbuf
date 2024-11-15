@@ -340,6 +340,7 @@ impl<T: Sized + Copy> Consumer<T> {
     ///
     /// On success returns count of elements been copied from the ring buffer (or any saved buffers).
     pub fn pop_slice(&mut self, elems: &mut [T]) -> usize {
+        const PARALLEL_COPY_CUTOFF: usize = 2048;
         let mut saved_buf_lock = self.rb.saved_buf.spin_lock().unwrap();
 
         let mut bytes_read = 0usize;
@@ -359,6 +360,39 @@ impl<T: Sized + Copy> Consumer<T> {
                 }
 
                 let copy_len = cmp::min(elems.len() - bytes_read, writer_buf.1);
+
+                if copy_len > PARALLEL_COPY_CUTOFF {
+                    // If there's enough bytes to copy in this single copy, we'll copy half and let
+                    // the writer copy the other.
+                    // TODO: IMPORTANT: Need to make sure we use the MINIMUM of the two buffer
+                    // lengths. Currently, if the reader's buffer (ours) is smaller than the
+                    // writers, everything will go wrong!
+                    let (writer_half_one, writer_half_two) = writer_buf.min_with(copy_len).split();
+                    let (reader_half_one, reader_half_two) = <&mut [T] as Into<MutBufferInfo<T>>>::into(&mut elems[bytes_read..]).min_with(copy_len).split();
+
+                    // Give the writer the second half
+                    *saved_buf_lock = SavedBuffer::CopyingHelpRequest(reader_half_two, writer_half_two, reader_half_one.1);
+
+                    // Drop the MutexGuard before copying, so that the writer can start copying too
+                    drop(saved_buf_lock);
+
+                    // Copy the first half ourselves
+                    unsafe {
+                        std::intrinsics::copy_nonoverlapping(writer_half_one.0, reader_half_one.0, reader_half_one.1);
+                    }
+
+                    self.rb.barrier.wait();
+
+                    // Re-grab the lock
+                    saved_buf_lock = self.rb.saved_buf.spin_lock().unwrap();
+
+                    //*saved_buf_lock = SavedBuffer::Copied(copy_len);
+                    *saved_buf_lock = SavedBuffer::None; // Done!
+                    bytes_read += copy_len;
+
+                    return bytes_read;
+                }
+
                 unsafe {
                     std::intrinsics::copy_nonoverlapping(
                         writer_buf.0,
@@ -378,9 +412,9 @@ impl<T: Sized + Copy> Consumer<T> {
                     std::println!("[RINGBUF DEBUG] Reader copied {copy_len} bytes directly from the writer's saved buffer");
                 }
 
-                if bytes_read == elems.len() {
-                    return bytes_read;
-                }
+                //if bytes_read == elems.len() {
+                return bytes_read;
+                //}
             }
         }
 
@@ -402,9 +436,7 @@ impl<T: Sized + Copy> Consumer<T> {
                     std::println!("[RINGBUF DEBUG] Reader stopped waiting and found the writer copied {num_copied} bytes to our buffer");
                 }
 
-                if bytes_read == elems.len() {
-                    return bytes_read;
-                }
+                return bytes_read;
             }
         }
 

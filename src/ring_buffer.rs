@@ -10,9 +10,9 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use libc::{syscall, timespec, SYS_futex, FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, INT_MAX};
-use std::ops::AddAssign;
+use std::ops::{AddAssign, Add};
 use std::ptr::addr_of_mut;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Barrier, Mutex, MutexGuard};
 use sync_spin::mutex_spin::SpinFirst;
 
 pub(crate) struct SharedVec<T: Sized> {
@@ -42,6 +42,7 @@ pub struct RingBuffer<T: Sized> {
     pub(crate) head: CachePadded<AtomicUsize>,
     pub(crate) tail: CachePadded<AtomicUsize>,
     pub(crate) saved_buf: CachePadded<Mutex<SavedBuffer<T>>>,
+    pub(crate) barrier: Barrier
 }
 
 impl<T: Sized> RingBuffer<T> {
@@ -54,6 +55,7 @@ impl<T: Sized> RingBuffer<T> {
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             saved_buf: CachePadded::new(SavedBuffer::new_mutex()),
+            barrier: Barrier::new(2)
         }
     }
 
@@ -217,6 +219,12 @@ impl<T: Sized> From<&[T]> for BufferInfo<T> {
     }
 }
 
+impl<T: Sized> From<MutBufferInfo<T>> for BufferInfo<T> {
+    fn from(value: MutBufferInfo<T>) -> Self {
+        Self(value.0 as *const T, value.1)
+    }
+}
+
 impl<T: Sized> AddAssign<usize> for BufferInfo<T> {
     fn add_assign(&mut self, rhs: usize) {
         self.0 = unsafe { self.0.add(rhs) };
@@ -224,15 +232,34 @@ impl<T: Sized> AddAssign<usize> for BufferInfo<T> {
     }
 }
 
+impl<T: Sized> BufferInfo<T> {
+    pub fn split(&self) -> (BufferInfo<T>, BufferInfo<T>) {
+        let half_len = self.1 / 2;
+        let (mut half_one, mut half_two) = (*self, *self);
+
+        half_one.1 = half_len;
+        half_two.0 = unsafe { half_two.0.byte_add(half_len) };
+        half_two.1 = self.1 - half_len;
+        
+        (half_one, half_two)
+    }
+
+    pub fn min_with(&self, other_min: usize) -> Self {
+        Self(self.0, min(other_min, self.1))
+    }
+}
+
 /// Mutable buffer info, holding a pointer and length
 #[derive(Debug)]
 pub(crate) struct MutBufferInfo<T: Sized>(pub *mut T, pub usize);
+
+impl<T: Sized> Copy for MutBufferInfo<T> {}
 impl<T: Sized> Clone for MutBufferInfo<T> {
     fn clone(&self) -> Self {
-        *self
+        Self (self.0, self.1)
     }
 }
-impl<T: Sized> Copy for MutBufferInfo<T> {}
+
 impl<'a, T: Sized> From<&'a MutBufferInfo<T>> for &'a mut [T] {
     fn from(value: &'a MutBufferInfo<T>) -> &'a mut [T] {
         unsafe { std::slice::from_raw_parts_mut(value.0, value.1) }
@@ -245,6 +272,40 @@ impl<T: Sized> From<&mut [T]> for MutBufferInfo<T> {
     }
 }
 
+impl<T: Sized> AddAssign<usize> for MutBufferInfo<T> {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 = unsafe { self.0.byte_add(rhs) };
+        self.1 -= rhs;
+    }
+}
+
+impl<T: Sized> Add<usize> for MutBufferInfo<T> {
+    type Output = MutBufferInfo<T>;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        let mut tmp = self;
+        tmp += rhs;
+        tmp
+    }
+}
+
+impl<T: Sized> MutBufferInfo<T> {
+    pub fn split(&self) -> (MutBufferInfo<T>, MutBufferInfo<T>) {
+        let half_len = self.1 / 2;
+        let (mut half_one, mut half_two) = (*self, *self);
+
+        half_one.1 = half_len;
+        half_two.0 = unsafe { half_two.0.byte_add(half_len) };
+        half_two.1 = self.1 - half_len;
+        
+        (half_one, half_two)
+    }
+
+    pub fn min_with(&self, other_min: usize) -> Self {
+        Self(self.0, min(other_min, self.1))
+    }
+}
+
 /// Enum which tracks saved buffer info
 #[derive(Debug)]
 #[repr(u32)]
@@ -253,6 +314,7 @@ pub(crate) enum SavedBuffer<T: Sized> {
     Writer(BufferInfo<T>) = 1,
     Copied(usize) = 2,
     None = 3,
+    CopyingHelpRequest(MutBufferInfo<T>, BufferInfo<T>, usize) = 4,
 }
 
 unsafe impl<T: Sized> Send for SavedBuffer<T> {}

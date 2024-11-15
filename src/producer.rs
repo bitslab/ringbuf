@@ -233,24 +233,18 @@ impl<T: Sized + Copy> Producer<T> {
         if cfg!(feature = "reader-sleep-copy") {
             // We need to check if the reader had a saved buffer
             if let SavedBuffer::<T>::Reader(reader_buf) = *saved_buf_lock {
-                if cfg!(feature = "debug-print") {
-                    std::println!("[RINGBUF DEBUG] Writer found a reader's saved buffer");
-                }
-
-                // Reader had a saved buffer; copy to it
+                // Reader had a saved buffer! Copy to it!
                 let reader_slice: &mut [T] = (&reader_buf).into();
                 let copy_len = cmp::min(elems.len(), reader_slice.len());
                 unsafe {
+                    // Perform the copy
+                    /* SAFETY: These buffers are in two separate "processes," so the slices should 
+                     * NOT have any overlap */
                     std::intrinsics::copy_nonoverlapping(elems.as_ptr(), reader_buf.0, copy_len);
-                    // my_memcpy(
-                    //     reader_buf.0 as _,
-                    //     elems.as_ptr() as _,
-                    //     copy_len * size_of::<T>(),
-                    // );
                 }
 
                 // Overwrite the enum for the saved buffer we just wrote to with the number of bytes we wrote
-                *saved_buf_lock = SavedBuffer::Copied(copy_len);
+                *saved_buf_lock = SavedBuffer::Copied(copy_len); // This way the reader will know we copied the buffer over
 
                 // Update the number of bytes written
                 bytes_written += copy_len;
@@ -266,9 +260,9 @@ impl<T: Sized + Copy> Producer<T> {
                 }
 
                 // If we've written all the bytes we want written, return now
-                if bytes_written == elems.len() {
-                    return bytes_written;
-                }
+                //if bytes_written == elems.len() {
+                return bytes_written;
+                //}
             }
         }
 
@@ -276,29 +270,38 @@ impl<T: Sized + Copy> Producer<T> {
             use std::ops::DerefMut;
             // We still have more to write.
             if saved_buf_lock.is_none() {
-                // Set our buffer if noone else has theirs saved
-                *saved_buf_lock = SavedBuffer::Writer(elems.into());
+                // Set our buffer if the reader hasn't saved one yet
+                *saved_buf_lock = SavedBuffer::Writer(elems.into()); // Grab lock without futex (hopefully faster)
 
-                if cfg!(feature = "debug-print") {
-                    std::println!(
-                        "[RINGBUF DEBUG] Writer saved their buffer and is about to start waiting for a reader single-copy"
-                    );
-                }
-
-                // let num_copied = saved_buf_lock.spin_on_condition(&self.rb.saved_buf);
                 let num_copied = loop {
+                    if let SavedBuffer::CopyingHelpRequest(reader_buf, req_writer_buf, readers_copy_len) = *saved_buf_lock {
+                        // Reader requested a copy (it will do a different one in parallel)
+                        unsafe {
+                            std::intrinsics::copy_nonoverlapping(req_writer_buf.0, reader_buf.0, reader_buf.1);
+                        }
+
+                        // Reader will also wait on this barrier after its copy
+                        self.rb.barrier.wait();
+
+                        // Assign to `num_copied` the amount we copied plus the amount the reader said they'd copy
+                        break reader_buf.1 + readers_copy_len;
+                    }
+
                     if let SavedBuffer::Copied(n) = *saved_buf_lock {
                         *saved_buf_lock = SavedBuffer::None;
                         break n;
                     }
 
-                    let num_bytes_pushing = cmp::min(32, elems.len() - bytes_written);
+                    // Push 1024 bytes (or whatever number of bytes less than 1024 we have left in our buffer) to the ring buffer
+                    let num_bytes_pushing = cmp::min(1024, elems.len() - bytes_written);
 
                     if let SavedBuffer::Writer(writer_buf) = saved_buf_lock.deref_mut() {
+                        // Before dropping the lock, move our saved writer's buffer (+ to ptr, - to size)
                         *writer_buf += num_bytes_pushing;
                     } else {
                         // SAFETY: We just set this enum to SavedBuffer::Writer and the reader hasn't set it to SavedBuffer::Copied yet
-                        unsafe { std::hint::unreachable_unchecked() };
+                        //unsafe { std::hint::unreachable_unchecked() };
+                        unreachable!(); // Just making "sure" this is actually unreachable
                     }
 
                     // Push a slice while we wait (instead of a "pause" instruction)
@@ -309,15 +312,21 @@ impl<T: Sized + Copy> Producer<T> {
                                 as *const [MaybeUninit<T>]),
                         );
                     }
-                    drop(saved_buf_lock); // It's finally safe to drop the lock. We've pushed the bytes we indicated we pushed by adding to our mutex-guarded buffer.
 
                     bytes_written = index_to_push_until;
 
+                    // If we've pushed everything we could, we can just return right now (after making sure we haven't left our writer buffer there!)
                     if bytes_written == elems.len() {
+                        // Make sure to reset the saved writer buffer to None before returning!
+                        *saved_buf_lock = SavedBuffer::None;
                         return bytes_written;
                     }
 
-                    saved_buf_lock = self.rb.saved_buf.spin_lock().unwrap();
+                    drop(saved_buf_lock); // It's finally safe to drop the lock. We've pushed the bytes we indicated we pushed by adding to our mutex-guarded writer's buffer.
+                    // Above dropping gives the reader some time to grab the lock when it arrives
+                    std::hint::spin_loop(); // Give the reader a bit of extra time to grab the lock instead of *immediately* grabbing it again
+
+                    saved_buf_lock = self.rb.saved_buf.spin_lock().unwrap(); // Grab lock without futex (hopefully faster)
                 };
                 bytes_written += num_copied;
 
