@@ -245,6 +245,7 @@ impl<T: Sized + Copy> Producer<T> {
 
                 // Overwrite the enum for the saved buffer we just wrote to with the number of bytes we wrote
                 *saved_buf_lock = SavedBuffer::Copied(copy_len); // This way the reader will know we copied the buffer over
+                drop(saved_buf_lock);
 
                 // Update the number of bytes written
                 bytes_written += copy_len;
@@ -259,10 +260,7 @@ impl<T: Sized + Copy> Producer<T> {
                     );
                 }
 
-                // If we've written all the bytes we want written, return now
-                //if bytes_written == elems.len() {
                 return bytes_written;
-                //}
             }
         }
 
@@ -300,8 +298,8 @@ impl<T: Sized + Copy> Producer<T> {
                         *writer_buf += num_bytes_pushing;
                     } else {
                         // SAFETY: We just set this enum to SavedBuffer::Writer and the reader hasn't set it to SavedBuffer::Copied yet
-                        //unsafe { std::hint::unreachable_unchecked() };
-                        unreachable!(); // Just making "sure" this is actually unreachable
+                        unsafe { std::hint::unreachable_unchecked() };
+                        //unreachable!(); // Just making "sure" this is actually unreachable
                     }
 
                     // Push a slice while we wait (instead of a "pause" instruction)

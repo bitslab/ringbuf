@@ -349,6 +349,11 @@ impl<T: Sized + Copy> Consumer<T> {
             self.pop_copy(&mut *(&mut elems[bytes_read..] as *mut [T] as *mut [MaybeUninit<T>]))
         };
 
+        // If we've already read all the bytes we came to read, we better not start spinning below!
+        if bytes_read == elems.len() {
+            return bytes_read;
+        }
+
         if cfg!(feature = "debug-print") {
             std::println!("[RINGBUF DEBUG] Reader pulled {bytes_read} bytes from the ring buffer");
         }
