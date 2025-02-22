@@ -77,8 +77,8 @@ impl<T: Sized, A: Allocator + Clone> RingBuffer<T, A> {
         let mut data = Vec::new_in(alloc.clone());
         data.resize_with(capacity + 1, MaybeUninit::uninit);
         let start = {
-            (rand::random::<usize>() % capacity) & // select a start byte from the buffer
-            (!0b0111111) // cache align it
+            (rand::random::<u64>() as usize % capacity) & // select a start byte from the buffer
+            (!0b0111111)                           // cache align it
         };
         Self {
             data: SharedVec::new(data),
