@@ -1,8 +1,5 @@
 use crate::{producer::Producer, ring_buffer::*};
 use alloc::sync::Arc;
-use std::ops::{Deref, DerefMut};
-use std::mem::ManuallyDrop;
-use std::sync::MutexGuard;
 use core::{
     cmp::{self, min},
     mem::{self, MaybeUninit},
@@ -13,6 +10,9 @@ use core::{
 use std::alloc::Allocator;
 #[cfg(feature = "std")]
 use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
+use std::sync::MutexGuard;
 
 use crate::loop_with_delay;
 /// Consumer part of ring buffer.
@@ -27,8 +27,8 @@ pub struct Consumer<T, A: Allocator + Clone> {
 //    }
 //}
 
-/* TODO:(Jacob) EXTREME: YOU NEED TO MAKE THIS A NOT-CLONE-IMPL FUNCTION, 
- * NAME IT SOMETHING DANGEROUS SOUNDING, 
+/* TODO:(Jacob) EXTREME: YOU NEED TO MAKE THIS A NOT-CLONE-IMPL FUNCTION,
+ * NAME IT SOMETHING DANGEROUS SOUNDING,
  * AND MAKE THAT FUNCTION UNSAFE! */
 //impl<T, A: Allocator + Clone> Clone for Consumer<T, A> {
 //    fn clone(&self) -> Self {
@@ -46,7 +46,7 @@ pub struct Consumer<T, A: Allocator + Clone> {
 
 /// Struct returned by `UnsafeConsumerClone::clone_without_arc_increment`. Derefs to `T` but will not drop `T` when it gets dropped
 pub struct ArcCloneNoDecr<T> {
-    inner: ManuallyDrop<T>
+    inner: ManuallyDrop<T>,
 }
 
 impl<T> Deref for ArcCloneNoDecr<T> {
@@ -66,7 +66,7 @@ impl<T> ArcCloneNoDecr<T> {
     /// Construct an [`ArcCloneNoDecr`] a moved `value: T`
     pub fn from(value: T) -> Self {
         Self {
-            inner: ManuallyDrop::new(value)
+            inner: ManuallyDrop::new(value),
         }
     }
 }
@@ -87,7 +87,7 @@ impl<T: Sized, A: Allocator + Clone> UnsafeConsumerClone for Consumer<T, A> {
         let rb_arc_clone = unsafe { Arc::from_raw_in(rb_arc_raw, self.rb.alloc.clone()) };
         ArcCloneNoDecr::from(Self {
             rb: rb_arc_clone,
-            nonblocking: self.nonblocking
+            nonblocking: self.nonblocking,
         })
     }
 }
@@ -123,8 +123,6 @@ impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
 
     /// Checks if the producer end is still present.
     pub fn is_producer_alive(&self) -> bool {
-        std::println!("Arc strong count: {}", Arc::strong_count(&self.rb));
-        std::thread::sleep_ms(1000);
         if Arc::strong_count(&self.rb) >= 2 {
             true
         } else {
@@ -134,6 +132,11 @@ impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
 
     pub fn set_nonblocking(&mut self) {
         self.nonblocking = true;
+    }
+
+    /// Returns a [`bool`] where `true` means this `Consumer` is non-blocking and `false` means it is blocking
+    pub fn is_nonblocking(&self) -> bool {
+        self.nonblocking
     }
 
     /// The remaining space in the buffer.
@@ -499,6 +502,23 @@ impl<A: Allocator + Clone> Consumer<u8, A> {
                 return Ok(n);
             }
         })
+    }
+
+    /// Performs a non-blocking read even if the `Consumer` is blocking, meaning there will be no looping or sleeping in this function.
+    /// # Important Implication
+    /// This means it is the *caller's* responsibility to check whether this [`Consumer`] is non-blocking (via [`Consumer::is_nonblocking`])
+    /// and loop or sleep **itself** if this function returns `EWOULDBLOCK` but the [`Consumer`] is blocking
+    pub fn read_nonblocking(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if !self.is_producer_alive() {
+            return Ok(0);
+        }
+        let n = self.pop_slice(buffer);
+        if n == 0 && self.is_producer_alive() {
+            // To prevent looping and sleeping in this function, we return EWOULDBLOCK even if `!self.nonblocking`
+            return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
+        } else {
+            return Ok(n);
+        }
     }
 }
 
