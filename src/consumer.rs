@@ -76,22 +76,6 @@ pub trait UnsafeConsumerClone: Sized {
     unsafe fn clone_without_arc_increment(&self) -> ArcCloneNoDecr<Self>;
 }
 
-impl<T: Sized, A: Allocator + Clone> UnsafeConsumerClone for Consumer<T, A> {
-    unsafe fn clone_without_arc_increment(&self) -> ArcCloneNoDecr<Self> {
-        let rb_arc_clone = self.rb.clone();
-
-        // Manually decrement this Arc's strong count so the net change for the clone is 0.
-        // SAFETY: This arc will only be used temporarily for a blocking read call. During that time there will always the parent Arc<Mutex<File>> so the strong count will never drop to zero.
-        let rb_arc_raw = Arc::into_raw(rb_arc_clone);
-        unsafe { Arc::decrement_strong_count(rb_arc_raw) };
-        let rb_arc_clone = unsafe { Arc::from_raw_in(rb_arc_raw, self.rb.alloc.clone()) };
-        ArcCloneNoDecr::from(Self {
-            rb: rb_arc_clone,
-            nonblocking: self.nonblocking,
-        })
-    }
-}
-
 impl<T: Sized, A: Allocator + Clone> Consumer<T, A> {
     /// Returns capacity of the ring buffer.
     ///
