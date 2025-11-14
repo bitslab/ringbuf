@@ -493,10 +493,16 @@ impl<A: Allocator + Clone> Consumer<u8, A> {
     /// This means it is the *caller's* responsibility to check whether this [`Consumer`] is non-blocking (via [`Consumer::is_nonblocking`])
     /// and loop or sleep **itself** if this function returns `EWOULDBLOCK` but the [`Consumer`] is blocking
     pub fn read_nonblocking(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.pop_slice(buffer);
+        if n > 0 {
+            return Ok(n);
+        }
+
         if !self.is_producer_alive() {
+            std::println!("[COMPOUND DEBUG] read_nonblocking returning Ok(0) because the producer is dead");
             return Ok(0);
         }
-        let n = self.pop_slice(buffer);
+
         if n == 0 && self.is_producer_alive() {
             // To prevent looping and sleeping in this function, we return EWOULDBLOCK even if `!self.nonblocking`
             return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
